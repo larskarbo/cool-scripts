@@ -1,0 +1,2 @@
+scp piclox:~/kest/Budget1.buckets ~/dev/kest/
+open ~/dev/kest/Budget1.buckets
