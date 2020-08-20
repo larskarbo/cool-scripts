@@ -1,0 +1,1 @@
+echo $1 going >> /Users/lars/dev/cool_scripts/mail.log
