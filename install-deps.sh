@@ -1,14 +1,18 @@
 #!/bin/bash
 
-if [[ -f "package-lock.json" ]]; then
-  echo "package-lock.json found. Using npm..."
-  npm i "$@"
+if [[ -f "pnpm-lock.yaml" ]]; then
+  echo "pnpm-lock.yaml found. Using pnpm..."
+  pnpm "$@"
 elif [[ -f "yarn.lock" ]]; then
   echo "yarn.lock found. Using Yarn..."
-  yarn i "$@"
-elif [[ -f "pnpm-lock.yaml" ]]; then
-  echo "pnpm-lock.yaml found. Using pnpm..."
-  pnpm i "$@"
+  yarn "$@"
+elif [[ -f "package-lock.json" ]]; then
+  echo "package-lock.json found. Using npm..."
+  npm "$@"
+elif [[ -f "bun.lockb" ]]; then
+  echo "bun.lockb found. Using bun..."
+  bun "$@"
 else
-  echo "No lock file found. Exiting..."
+  echo "No lock file found. Using npm..."
+	npm "$@"
 fi
