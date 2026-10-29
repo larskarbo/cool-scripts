@@ -25,3 +25,35 @@ test('hung commands terminate and failures remain visible', async () => {
   expect(r.ms).toBeLessThan(2000);
   expect((await run(['/nonexistent/fixmyinternet-test'])).code).not.toBe(0);
 });
+
+import { diagnose, checkRows } from '../fixmyinternet';
+function fakeRunner(googleOK) {
+  return async cmd => {
+    const url = cmd.at(-1);
+    let out = '', code = 1;
+    if (cmd.includes('-listallhardwareports')) { out = 'Hardware Port: Wi-Fi\nDevice: en7'; code = 0; }
+    if (url === 'http://alwayshttp.com/') { out = '200'; code = 0; }
+    if (url === 'https://www.google.com/' && googleOK) { out = '200'; code = 0; }
+    if (cmd.includes('--dns') || cmd.includes('--proxy') || cmd.includes('--nc')) code = 0;
+    await Bun.sleep(url === 'http://alwayshttp.com/' ? 15 : 1);
+    return { cmd, out, code, err: '', ms: 1 };
+  };
+}
+test('progress reports pending and completed checks separately; Google counts as HTTPS', async () => {
+  const updates = [];
+  const result = await diagnose(s => updates.push(s), fakeRunner(true));
+  expect(checkRows(updates[0]).every(r => r.state === 'running')).toBe(true);
+  expect(updates.some(s => s.raw.google && !s.raw.alwayshttp)).toBe(true);
+  expect(result.https).toBe(true);
+  expect(checkRows(result).some(r => r.state === 'running')).toBe(false);
+  expect(checkRows(result).find(r => r.label === 'google.com · HTTPS').state).toBe('pass');
+  expect(checkRows(result).find(r => r.label === 'apple.com · HTTPS').state).toBe('fail');
+});
+test('plain HTTP success does not imply HTTPS works; missing lease is inconclusive', async () => {
+  const result = await diagnose(() => {}, fakeRunner(false));
+  expect(result.https).toBe(false);
+  expect(checkRows(result).find(r => r.label === 'alwayshttp.com · HTTP').state).toBe('pass');
+  expect(checkRows(result).find(r => r.label === 'DHCP lease').state).toBe('warning');
+  result.raw.alwayshttp.out = '503';
+  expect(checkRows(result).find(r => r.label === 'alwayshttp.com · HTTP').state).toBe('fail');
+});

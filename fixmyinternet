@@ -27,9 +27,15 @@ export function assess(s) {
   return { action: '8', text: 'Internet probes failed. Check network details and VPN settings, then try reconnecting Wi-Fi. Probe blocking is also possible.' };
 }
 const curl = url => ['/usr/bin/curl', '-q', '--noproxy', '*', '--connect-timeout', '3', '--max-time', '6', '-sS', '-o', '/dev/null', '-w', '%{http_code}', url];
-export async function diagnose() {
-  const hw = await run(['/usr/sbin/networksetup', '-listallhardwareports']);
-  const device = wifiDevice(hw.out);
+export async function diagnose(onProgress = () => {}, runner = run) {
+  const raw = {};
+  let device;
+  const update = () => onProgress({ raw: { ...raw }, device, running: true });
+  update();
+  const hw = await runner(['/usr/sbin/networksetup', '-listallhardwareports']);
+  device = wifiDevice(hw.out);
+  raw.hardware = hw;
+  update();
   const commands = {
     route: ['/sbin/route', '-n', 'get', 'default'],
     dns: ['/usr/bin/dscacheutil', '-q', 'host', '-a', 'name', 'www.apple.com'],
@@ -37,6 +43,8 @@ export async function diagnose() {
     tcp2: ['/usr/bin/nc', '-z', '-G', '3', '-w', '3', '8.8.8.8', '443'],
     apple: curl('https://www.apple.com/'),
     cloudflare: curl('https://www.cloudflare.com/'),
+    google: curl('https://www.google.com/'),
+    alwayshttp: curl('http://alwayshttp.com/'),
     portal: ['/usr/bin/curl', '-q', '--noproxy', '*', '--connect-timeout', '3', '--max-time', '6', '--max-filesize', '65536', '-sS', '-w', '\n%{http_code}', 'http://captive.apple.com/hotspot-detect.html'],
     resolvers: ['/usr/sbin/scutil', '--dns'],
     proxies: ['/usr/sbin/scutil', '--proxy'],
@@ -47,7 +55,9 @@ export async function diagnose() {
     power: ['/usr/sbin/networksetup', '-getairportpower', device],
     dhcp: ['/usr/sbin/ipconfig', 'getpacket', device],
   });
-  const raw = Object.fromEntries(await Promise.all(Object.entries(commands).map(async ([k, cmd]) => [k, await run(cmd)])));
+  await Promise.all(Object.entries(commands).map(async ([k, cmd]) => {
+    raw[k] = await runner(cmd); update();
+  }));
   const ip = raw.ip?.out || '';
   const httpOK = r => r.code === 0 && /^[23]\d\d$/.test(r.out);
   const portalCode = raw.portal.out.split('\n').at(-1);
@@ -59,7 +69,7 @@ export async function diagnose() {
     gateway: raw.route.out.match(/gateway: (\S+)/)?.[1] || '',
     dns: /(?:ip_address|ipv6_address):/.test(raw.dns.out),
     direct: raw.tcp1.code === 0 || raw.tcp2.code === 0,
-    https: httpOK(raw.apple) || httpOK(raw.cloudflare),
+    https: httpOK(raw.apple) || httpOK(raw.cloudflare) || httpOK(raw.google),
     portal: raw.portal.code === 0 && (/^3\d\d$/.test(portalCode) || (portalCode === '200' && !/<BODY>Success<\/BODY>/i.test(raw.portal.out))),
     raw,
   };
@@ -100,7 +110,7 @@ function dashboard(s) {
     `  ${muted('─'.repeat(width()))}`,
   ];
 }
-function show(s) { console.log(dashboard(s).map(line => fit(line, width() + 2)).join('\n') + '\n'); }
+function show(s) { console.log([...dashboard(s), ...checklist(s)].map(line => fit(line, width() + 2)).join('\n') + '\n'); }
 const actions = [
   ['1', 'Check again', 'Run a fresh connection check'],
   ['6', 'Monitor connection', 'Watch for 60 seconds while you change networks'],
@@ -137,31 +147,81 @@ function wrapOption(text, columns) {
   }
   lines.push(text); return lines;
 }
+export function checkRows(s) {
+  const r = s.raw;
+  const row = (label, keys, evaluate) => {
+    if (keys.some(k => !r[k])) return { label, state: 'running', detail: 'checking…' };
+    const [ok, detail] = evaluate();
+    return { label, state: ok === null ? 'warning' : ok ? 'pass' : 'fail', detail };
+  };
+  const rows = [
+    !r.hardware ? { label: 'Wi-Fi / IPv4', state: 'running', detail: 'finding adapter…' } : !s.device
+      ? { label: 'Wi-Fi / IPv4', state: 'warning', detail: 'no Wi-Fi adapter' }
+      : row('Wi-Fi / IPv4', ['power', 'ip'], () => [!/: Off/.test(r.power.out) && !!r.ip.out && !r.ip.out.startsWith('169.254.'), r.ip.out || 'no IPv4 address']),
+    row('Default route', ['route'], () => [r.route.code === 0, r.route.out.match(/gateway: (\S+)/)?.[1] || 'no IPv4 route']),
+    row('Direct TCP :443', ['tcp1', 'tcp2'], () => [r.tcp1.code === 0 || r.tcp2.code === 0, `${r.tcp1.code === 0 ? '✓' : '×'} 1.1.1.1  ${r.tcp2.code === 0 ? '✓' : '×'} 8.8.8.8`]),
+    row('System DNS', ['dns'], () => [/(?:ip_address|ipv6_address):/.test(r.dns.out), /(?:ip_address|ipv6_address):/.test(r.dns.out) ? 'apple.com resolved' : 'no answer']),
+  ];
+  for (const [key, label] of [['apple', 'apple.com · HTTPS'], ['cloudflare', 'cloudflare.com · HTTPS'], ['google', 'google.com · HTTPS'], ['alwayshttp', 'alwayshttp.com · HTTP']]) {
+    rows.push(row(label, [key], () => [r[key].code === 0 && /^[23]\d\d$/.test(r[key].out), r[key].code === 0 ? `HTTP ${r[key].out} · ${r[key].ms} ms` : r[key].code === 28 ? 'timed out' : `failed · curl ${r[key].code}`]));
+  }
+  rows.push(row('Network login', ['portal'], () => {
+    if (r.portal.code !== 0) return [null, 'check inconclusive'];
+    if (r.portal.out.endsWith('\n200') && /<BODY>Success<\/BODY>/i.test(r.portal.out)) return [true, 'no login detected'];
+    return [null, 'possible login / interception'];
+  }));
+  rows.push(row('DNS / proxy / VPN', ['resolvers', 'proxies', 'vpn'], () => {
+    const vpn = r.vpn.out.split('\n').filter(l => l.includes('(Connected)')).map(l => l.match(/"([^"]+)"/)?.[1] || 'VPN');
+    const proxy = /\w+Enable\s*:\s*1/.test(r.proxies.out);
+    const ok = ['resolvers', 'proxies', 'vpn'].every(k => r[k].code === 0);
+    return [ok, !ok ? 'could not read settings' : [vpn.length ? vpn.join(', ') : 'no listed VPN', proxy ? 'proxy enabled' : 'no proxy'].join(' · ')];
+  }));
+  if (s.device) rows.push(row('DHCP lease', ['dhcp'], () => [r.dhcp.out ? true : null, r.dhcp.out ? 'received' : 'no DHCP packet (may be static)']));
+  return rows;
+}
+function checklist(s) {
+  const rows = checkRows(s);
+  const done = rows.filter(r => r.state !== 'running').length;
+  const spinner = ['◜', '◠', '◝', '◞', '◡', '◟'][Math.floor(Date.now() / 100) % 6];
+  return [
+    `  ${muted('CHECKS')} ${muted(`${done}/${rows.length}`)}${s.running ? accent(' · running') : ''}`,
+    ...rows.map(r => {
+      const symbol = { pass: '✓', fail: '×', warning: '!', running: spinner }[r.state];
+      const tint = { pass: '38;5;114', fail: '38;5;203', warning: '38;5;221', running: '38;5;111' }[r.state];
+      return `  ${paint(tint, symbol)} ${r.label.padEnd(23)} ${muted(r.detail)}`;
+    }),
+  ];
+}
+function renderScreen(s, index) {
+  const recommended = s.https ? '6' : s.advice?.action;
+  const checks = checklist(s);
+  const title = s.running ? 'Checking connection…' : s.https ? 'You’re online' : s.portal ? 'Network login needed?' : 'Connection needs attention';
+  const top = [`  ${accent('◈')} ${paint(1, 'fixmyinternet')}  ${s.running ? muted(title) : paint(s.https ? '38;5;114' : '38;5;221', title)}`, `  ${muted('─'.repeat(width()))}`];
+  const budget = Math.max(3, (process.stdout.rows || 30) - top.length - checks.length - 7);
+  const entries = actions.map(([id, label]) => wrapOption(`${label} (${actionCommand(id, s)})`, width() - 2));
+  let start = index;
+  let used = entries[index].length;
+  while (start > 0 && used + entries[start - 1].length <= Math.floor(budget / 2)) used += entries[--start].length;
+  const lines = [...top, `  ${muted('ACTIONS')} ${muted(`${index + 1}/${actions.length}`)}`];
+  used = 0;
+  for (let i = start; i < actions.length; i++) {
+    if (used + entries[i].length > budget && i > index) break;
+    for (let j = 0; j < entries[i].length; j++) {
+      const marker = i === index && j === 0 ? accent('›') : ' ';
+      lines.push(`  ${marker} ${i === index ? accent(entries[i][j]) : muted(entries[i][j])}`);
+    }
+    used += entries[i].length;
+  }
+  lines.push(`  ${actions[index][0] === recommended ? accent('Recommended · ') : ''}${muted(actions[index][2])}`, `  ${muted('─'.repeat(width()))}`, ...checks, '', `  ${muted(s.running ? 'Checks run in parallel · Ctrl-C to exit' : '↑ ↓ navigate   enter select   q quit')}`);
+  process.stdout.write('\x1b[H\x1b[2J' + lines.map(l => fit(l, width() + 2)).join('\n'));
+}
 async function selectAction(s) {
   const recommended = s.https ? '6' : s.advice.action;
   let index = actions.findIndex(a => a[0] === recommended);
   return new Promise(resolve => {
     const wasRaw = process.stdin.isRaw;
-    const render = () => {
-      const top = dashboard(s);
-      const budget = Math.max(4, (process.stdout.rows || 30) - top.length - 7);
-      const entries = actions.map(([id, label]) => wrapOption(`${label} (${actionCommand(id, s)})`, width() - 2));
-      let start = index;
-      let used = entries[index].length;
-      while (start > 0 && used + entries[start - 1].length <= Math.floor(budget / 2)) used += entries[--start].length;
-      const lines = [...top, `  ${muted('WHAT WOULD YOU LIKE TO DO?')}`, ''];
-      used = 0;
-      for (let i = start; i < actions.length; i++) {
-        if (used + entries[i].length > budget && i > index) break;
-        for (let j = 0; j < entries[i].length; j++) {
-          const marker = i === index && j === 0 ? accent('›') : ' ';
-          lines.push(`  ${marker} ${i === index ? accent(entries[i][j]) : muted(entries[i][j])}`);
-        }
-        used += entries[i].length;
-      }
-      lines.push('', `  ${actions[index][0] === recommended ? accent('Recommended · ') : ''}${muted(actions[index][2])}`, '', `  ${muted('↑ ↓ navigate   enter select   q quit')}  ${muted(`${index + 1}/${actions.length}`)}`);
-      process.stdout.write('\x1b[?25l\x1b[H\x1b[2J' + lines.map(l => fit(l, width() + 2)).join('\n'));
-    };
+    process.stdout.write('\x1b[?25l');
+    const render = () => renderScreen(s, index);
     const finish = id => {
       process.stdin.removeListener('data', onData);
       process.stdout.removeListener('resize', render);
@@ -187,12 +247,13 @@ async function ask(q) {
   try { return (await rl.question(`  ${q}`)).trim().toLowerCase(); }
   finally { rl.close(); }
 }
-async function checking() {
+async function checking(previous) {
   if (!process.stdout.isTTY) return diagnose();
-  const frames = ['◜', '◠', '◝', '◞', '◡', '◟']; let i = 0;
-  const draw = () => process.stdout.write(`\r\x1b[2K  ${accent(frames[i++ % frames.length])} ${muted('Checking Wi-Fi, DNS and internet access…')}`);
-  draw(); const timer = setInterval(draw, 90);
-  try { return await diagnose(); } finally { clearInterval(timer); process.stdout.write('\r\x1b[2K'); }
+  let progress = { raw: {}, device: previous?.device, running: true };
+  const draw = () => renderScreen(progress, 0);
+  draw(); const timer = setInterval(draw, 100);
+  try { return await diagnose(s => { progress = s; draw(); }); }
+  finally { clearInterval(timer); }
 }
 async function execute(cmd) {
   console.log(paint(2, `  $ ${cmd.join(' ')}`));
@@ -203,7 +264,7 @@ async function monitor(history, seconds = 60) {
   console.log(`Watching for ${seconds}s; Ctrl-C exits. Each pass can take up to 9s.`);
   const start = Date.now();
   do {
-    const s = await diagnose(); history.push(s);
+    const s = await checking(history.at(-1)); history.push(s);
     if (process.stdout.isTTY) process.stdout.write('\x1b[H\x1b[2J');
     show(s);
     const elapsed = Math.round((Date.now() - start) / 1000);
@@ -216,7 +277,7 @@ async function monitor(history, seconds = 60) {
 async function main() {
   const args = process.argv.slice(2);
   if (args.includes('--help') || args.includes('-h')) {
-    console.log('fixmyinternet — interactive macOS network troubleshooting\n\n  fixmyinternet           Diagnose, then choose a fix\n  fixmyinternet --check   Read-only diagnosis (exit 0: HTTPS works; 1: failed)\n  fixmyinternet --json    Read-only diagnostic JSON\n  fixmyinternet --watch   Monitor for 60 seconds\n\nNo dependencies beyond Bun and macOS. Fixes run only when selected.\nProbes contact Apple, Cloudflare and Google; they do not upload reports.\nReports are saved only on request to ~/Downloads, with local network details.'); return;
+    console.log('fixmyinternet — interactive macOS network troubleshooting\n\n  fixmyinternet           Diagnose, then choose a fix\n  fixmyinternet --check   Read-only diagnosis (exit 0: HTTPS works; 1: failed)\n  fixmyinternet --json    Read-only diagnostic JSON\n  fixmyinternet --watch   Monitor for 60 seconds\n\nNo dependencies beyond Bun and macOS. Fixes run only when selected.\nProbes contact Apple, Cloudflare, Google and alwayshttp.com; they do not upload reports.\nReports are saved only on request to ~/Downloads, with local network details.'); return;
   }
   if (args.some(a => !['--check', '--json', '--watch'].includes(a)) || args.length > 1) throw new Error('Unknown or conflicting options. Run fixmyinternet --help.');
   if (process.platform !== 'darwin') throw new Error('This tool requires macOS.');
@@ -225,8 +286,7 @@ async function main() {
   if (!args.includes('--json')) console.log(`\n  ${accent('◈')} ${paint(1, 'fixmyinternet')}\n`);
   let s = await (args.includes('--json') ? diagnose() : checking()); history.push(s);
   if (args.includes('--json')) { console.log(JSON.stringify(s, null, 2)); process.exitCode = s.https ? 0 : 1; return; }
-  show(s);
-  if (args.includes('--check') || !process.stdin.isTTY || !process.stdout.isTTY) { process.exitCode = s.https ? 0 : 1; return; }
+  if (args.includes('--check') || !process.stdin.isTTY || !process.stdout.isTTY) { show(s); process.exitCode = s.https ? 0 : 1; return; }
   while (true) {
       const choice = await selectAction(s);
       if (choice === 'q') break;
@@ -282,7 +342,7 @@ async function main() {
           }
           console.log('Waiting 4 seconds for network configuration…'); await Bun.sleep(4000);
         } else if (choice !== '1') { console.log('Choose 1–9 or q.'); continue; }
-        s = await checking(); history.push(s); show(s);
+        s = await checking(s); history.push(s);
       } catch (e) { console.log(paint(31, `\n${e.message}`)); await ask('Press enter to return.'); }
   }
 }
