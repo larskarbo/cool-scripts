@@ -68,7 +68,7 @@ export async function diagnose() {
 }
 const accent = s => paint('38;5;111', s);
 const muted = s => paint('38;5;245', s);
-const width = () => Math.max(24, Math.min(76, (process.stdout.columns || 80) - 4));
+const width = () => Math.max(24, Math.min(120, (process.stdout.columns || 80) - 4));
 function fit(s, max = width()) {
   let n = 0;
   return s.split(/(\x1b\[[0-9;]*m)/).map(part => {
@@ -113,6 +113,30 @@ const actions = [
   ['9', 'Network settings', 'Open macOS Network settings'],
   ['q', 'Quit', 'Leave your connection as it is'],
 ];
+function actionCommand(id, s) {
+  const device = s.device || '<Wi-Fi interface>';
+  return {
+    '1': 'fixmyinternet --check',
+    '6': 'fixmyinternet --watch',
+    '2': 'sudo dscacheutil -flushcache && sudo killall -HUP mDNSResponder',
+    '3': `sudo ipconfig set ${device} DHCP`,
+    '4': `sudo networksetup -setairportpower ${device} off; sleep 1.5; sudo networksetup -setairportpower ${device} on`,
+    '5': 'open http://captive.apple.com/hotspot-detect.html',
+    '8': `route -n get default; ipconfig getpacket ${device}; scutil --dns; scutil --proxy; scutil --nc list`,
+    '7': 'writeFile → ~/Downloads/fixmyinternet-<timestamp>.json',
+    '9': 'open x-apple.systempreferences:com.apple.Network-Settings.extension',
+    'q': 'return',
+  }[id];
+}
+function wrapOption(text, columns) {
+  const lines = [];
+  while (text.length > columns) {
+    const space = text.lastIndexOf(' ', columns);
+    const cut = space > 0 ? space : columns;
+    lines.push(text.slice(0, cut)); text = text.slice(cut).trimStart();
+  }
+  lines.push(text); return lines;
+}
 async function selectAction(s) {
   const recommended = s.https ? '6' : s.advice.action;
   let index = actions.findIndex(a => a[0] === recommended);
@@ -120,15 +144,22 @@ async function selectAction(s) {
     const wasRaw = process.stdin.isRaw;
     const render = () => {
       const top = dashboard(s);
-      const count = Math.max(3, Math.min(actions.length, (process.stdout.rows || 30) - top.length - 7));
-      const start = Math.min(Math.max(0, index - Math.floor(count / 2)), actions.length - count);
+      const budget = Math.max(4, (process.stdout.rows || 30) - top.length - 7);
+      const entries = actions.map(([id, label]) => wrapOption(`${label} (${actionCommand(id, s)})`, width() - 2));
+      let start = index;
+      let used = entries[index].length;
+      while (start > 0 && used + entries[start - 1].length <= Math.floor(budget / 2)) used += entries[--start].length;
       const lines = [...top, `  ${muted('WHAT WOULD YOU LIKE TO DO?')}`, ''];
-      for (let i = start; i < start + count; i++) {
-        const [id, label] = actions[i];
-        const tag = id === recommended ? '  recommended' : '';
-        lines.push(i === index ? `  ${accent('›')} ${paint('1;38;5;111', label)}${accent(tag)}` : `    ${muted(label)}${muted(tag)}`);
+      used = 0;
+      for (let i = start; i < actions.length; i++) {
+        if (used + entries[i].length > budget && i > index) break;
+        for (let j = 0; j < entries[i].length; j++) {
+          const marker = i === index && j === 0 ? accent('›') : ' ';
+          lines.push(`  ${marker} ${i === index ? accent(entries[i][j]) : muted(entries[i][j])}`);
+        }
+        used += entries[i].length;
       }
-      lines.push('', `  ${muted(actions[index][2])}`, '', `  ${muted('↑ ↓ navigate   enter select   q quit')}  ${muted(`${index + 1}/${actions.length}`)}`);
+      lines.push('', `  ${actions[index][0] === recommended ? accent('Recommended · ') : ''}${muted(actions[index][2])}`, '', `  ${muted('↑ ↓ navigate   enter select   q quit')}  ${muted(`${index + 1}/${actions.length}`)}`);
       process.stdout.write('\x1b[?25l\x1b[H\x1b[2J' + lines.map(l => fit(l, width() + 2)).join('\n'));
     };
     const finish = id => {
