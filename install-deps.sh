@@ -12,6 +12,9 @@ elif [[ -f "package-lock.json" ]]; then
 elif [[ -f "bun.lockb" ]]; then
   echo "bun.lockb found. Using bun..."
   bun "$@"
+elif [[ -f "bun.lock" ]]; then
+  echo "bun.lock found. Using bun..."
+  bun "$@"
 else
   echo "No lock file found. Using npm..."
 	npm "$@"
