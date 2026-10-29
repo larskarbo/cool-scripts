@@ -66,19 +66,102 @@ export async function diagnose() {
   s.advice = assess(s);
   return s;
 }
-function show(s) {
-  const row = (ok, label, detail) => console.log(`  ${paint(ok ? 32 : 33, ok ? '✓' : '·')} ${label.padEnd(17)} ${detail}`);
-  console.log(`\n${paint(1, 'Connection check')}  ${new Date(s.time).toLocaleTimeString()}`);
-  row(!!s.device && !s.wifiOff, 'Wi-Fi', s.device ? `${s.device} · ${s.wifiOff ? 'off' : 'on'} · ${s.ip || 'no IPv4 address'}` : 'No Wi-Fi adapter detected');
-  row(!!s.route, 'IPv4 route', s.route ? `${s.route} via ${s.gateway}` : 'No default route');
-  row(s.direct, 'Direct TCP', s.direct ? 'Reachable without DNS' : 'Both probes failed or were blocked');
-  row(s.dns, 'System DNS', s.dns ? 'Name resolved' : 'No answer within the timeout');
-  row(s.https, 'HTTPS', s.https ? 'Public website reachable' : 'Both website checks failed');
-  row(!s.portal, 'Login portal', s.portal ? 'Possible login / interception detected' : s.raw.portal.code ? 'Check inconclusive' : 'No login detected');
-  const vpn = s.raw.vpn.out.split('\n').filter(l => l.includes('(Connected)'));
-  if (vpn.length) console.log(paint(33, `  VPN active: ${vpn.map(l => l.match(/"([^"]+)"/)?.[1] || l).join(', ')}`));
-  if (/\w+Enable\s*:\s*1/.test(s.raw.proxies.out)) console.log(paint(33, '  A system proxy is enabled. Browser behavior may differ from these direct probes.'));
-  console.log(`\n  ${paint(36, s.advice.text)}\n`);
+const accent = s => paint('38;5;111', s);
+const muted = s => paint('38;5;245', s);
+const width = () => Math.max(24, Math.min(76, (process.stdout.columns || 80) - 4));
+function fit(s, max = width()) {
+  let n = 0;
+  return s.split(/(\x1b\[[0-9;]*m)/).map(part => {
+    if (part.startsWith('\x1b')) return part;
+    const chars = [...part];
+    const out = chars.slice(0, Math.max(0, max - n)).join(''); n += chars.length;
+    return out;
+  }).join('') + (color ? '\x1b[0m' : '');
+}
+function dashboard(s) {
+  const ok = (value, label) => paint(value ? '38;5;114' : '38;5;221', `${value ? '●' : '○'} ${label}`);
+  const vpn = s.raw.vpn.out.split('\n').filter(l => l.includes('(Connected)')).map(l => l.match(/"([^"]+)"/)?.[1] || 'VPN');
+  const title = s.https ? 'You’re online' : s.portal ? 'This network may need a login' : 'Let’s get you connected';
+  const subtitle = s.https ? 'Web access is working. Catch the next delay with Monitor.' : {
+    '2': 'The connection works, but names aren’t resolving.',
+    '3': 'Still waiting for a network address. Try DHCP.',
+    '4': 'Wi-Fi is switched off.',
+    '5': 'Open the login page to finish connecting.',
+    '8': 'Check the connection details and any active VPN.',
+  }[s.advice.action] || s.advice.text;
+  return [
+    '', `  ${accent('◈')}  ${paint(1, 'fixmyinternet')} ${muted(' / network first aid')}`,
+    `  ${muted('─'.repeat(width()))}`, '',
+    `  ${paint(s.https ? '1;38;5;114' : '1;38;5;221', title)}`,
+    `  ${muted(subtitle)}`, '',
+    `  ${[ok(!!s.device && !s.wifiOff, 'Wi-Fi'), ok(s.direct, 'Internet'), ok(s.dns, 'DNS'), ok(s.https, 'HTTPS')].join('    ')}`,
+    `  ${muted([s.device, s.ip || 'No IPv4', vpn.length ? `VPN: ${vpn.join(', ')}` : null].filter(Boolean).join('  ·  '))}`,
+    ...(/\w+Enable\s*:\s*1/.test(s.raw.proxies.out) ? [`  ${paint('38;5;221', 'System proxy enabled · browser results may differ')}`] : []),
+    `  ${muted('─'.repeat(width()))}`,
+  ];
+}
+function show(s) { console.log(dashboard(s).map(line => fit(line, width() + 2)).join('\n') + '\n'); }
+const actions = [
+  ['1', 'Check again', 'Run a fresh connection check'],
+  ['6', 'Monitor connection', 'Watch for 60 seconds while you change networks'],
+  ['2', 'Refresh DNS', 'Clear cached answers without changing your DNS servers'],
+  ['3', 'Request a new IP', 'Restart DHCP · briefly interrupts your connection'],
+  ['4', 'Reconnect Wi-Fi', 'Switch Wi-Fi off and on · keeps your saved networks'],
+  ['5', 'Open network login', 'Finish signing in to hotel, café or public Wi-Fi'],
+  ['8', 'Inspect connection', 'View routes, DNS servers, DHCP, proxies and VPNs'],
+  ['7', 'Save a report', 'Save diagnostic history privately to Downloads'],
+  ['9', 'Network settings', 'Open macOS Network settings'],
+  ['q', 'Quit', 'Leave your connection as it is'],
+];
+async function selectAction(s) {
+  const recommended = s.https ? '6' : s.advice.action;
+  let index = actions.findIndex(a => a[0] === recommended);
+  return new Promise(resolve => {
+    const wasRaw = process.stdin.isRaw;
+    const render = () => {
+      const top = dashboard(s);
+      const count = Math.max(3, Math.min(actions.length, (process.stdout.rows || 30) - top.length - 7));
+      const start = Math.min(Math.max(0, index - Math.floor(count / 2)), actions.length - count);
+      const lines = [...top, `  ${muted('WHAT WOULD YOU LIKE TO DO?')}`, ''];
+      for (let i = start; i < start + count; i++) {
+        const [id, label] = actions[i];
+        const tag = id === recommended ? '  recommended' : '';
+        lines.push(i === index ? `  ${accent('›')} ${paint('1;38;5;111', label)}${accent(tag)}` : `    ${muted(label)}${muted(tag)}`);
+      }
+      lines.push('', `  ${muted(actions[index][2])}`, '', `  ${muted('↑ ↓ navigate   enter select   q quit')}  ${muted(`${index + 1}/${actions.length}`)}`);
+      process.stdout.write('\x1b[?25l\x1b[H\x1b[2J' + lines.map(l => fit(l, width() + 2)).join('\n'));
+    };
+    const finish = id => {
+      process.stdin.removeListener('data', onData);
+      process.stdout.removeListener('resize', render);
+      process.removeListener('SIGTERM', onTerm);
+      process.stdin.setRawMode(!!wasRaw); process.stdin.pause();
+      process.stdout.write('\x1b[?25h\n\n'); resolve(id);
+    };
+    const onTerm = () => finish('q');
+    const onData = data => {
+      const key = data.toString();
+      if (key === 'q' || key === '\x03' || key === '\x04' || key === '\x1b') return finish('q');
+      if (key === '\r' || key === '\n') return finish(actions[index][0]);
+      if (key === '\x1b[A' || key === 'k') index = (index - 1 + actions.length) % actions.length;
+      if (key === '\x1b[B' || key === 'j' || key === '\t') index = (index + 1) % actions.length;
+      render();
+    };
+    process.stdin.setRawMode(true); process.stdin.resume(); process.stdin.on('data', onData);
+    process.stdout.on('resize', render); process.once('SIGTERM', onTerm); render();
+  });
+}
+async function ask(q) {
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  try { return (await rl.question(`  ${q}`)).trim().toLowerCase(); }
+  finally { rl.close(); }
+}
+async function checking() {
+  if (!process.stdout.isTTY) return diagnose();
+  const frames = ['◜', '◠', '◝', '◞', '◡', '◟']; let i = 0;
+  const draw = () => process.stdout.write(`\r\x1b[2K  ${accent(frames[i++ % frames.length])} ${muted('Checking Wi-Fi, DNS and internet access…')}`);
+  draw(); const timer = setInterval(draw, 90);
+  try { return await diagnose(); } finally { clearInterval(timer); process.stdout.write('\r\x1b[2K'); }
 }
 async function execute(cmd) {
   console.log(paint(2, `  $ ${cmd.join(' ')}`));
@@ -89,8 +172,13 @@ async function monitor(history, seconds = 60) {
   console.log(`Watching for ${seconds}s; Ctrl-C exits. Each pass can take up to 9s.`);
   const start = Date.now();
   do {
-    const s = await diagnose(); history.push(s); show(s);
-    console.log(`  Elapsed ${Math.round((Date.now() - start) / 1000)}s`);
+    const s = await diagnose(); history.push(s);
+    if (process.stdout.isTTY) process.stdout.write('\x1b[H\x1b[2J');
+    show(s);
+    const elapsed = Math.round((Date.now() - start) / 1000);
+    const filled = Math.min(24, Math.round(elapsed / seconds * 24));
+    console.log(`  ${accent('━'.repeat(filled))}${muted('─'.repeat(24 - filled))}  ${elapsed}s / ${seconds}s`);
+    console.log(`\n  ${muted('Monitoring connection · Ctrl-C to exit')}`);
     if (Date.now() - start < seconds * 1000) await Bun.sleep(2000);
   } while (Date.now() - start < seconds * 1000);
 }
@@ -103,17 +191,13 @@ async function main() {
   if (process.platform !== 'darwin') throw new Error('This tool requires macOS.');
   const history = [];
   if (args.includes('--watch')) { await monitor(history); return; }
-  if (!args.includes('--json')) console.log(`\n${paint(1, 'fixmyinternet')} ${paint(2, '· macOS network first aid')}\nChecking your connection…`);
-  let s = await diagnose(); history.push(s);
+  if (!args.includes('--json')) console.log(`\n  ${accent('◈')} ${paint(1, 'fixmyinternet')}\n`);
+  let s = await (args.includes('--json') ? diagnose() : checking()); history.push(s);
   if (args.includes('--json')) { console.log(JSON.stringify(s, null, 2)); process.exitCode = s.https ? 0 : 1; return; }
   show(s);
-  if (args.includes('--check') || !process.stdin.isTTY) { process.exitCode = s.https ? 0 : 1; return; }
-  const rl = createInterface({ input: process.stdin, output: process.stdout });
-  const ask = async q => (await rl.question(q)).trim().toLowerCase();
-  try {
-    while (true) {
-      console.log('  1  Check again                6  Monitor for 60 seconds\n  2  Refresh DNS cache          7  Save diagnostic report\n  3  Request DHCP configuration 8  Show network details\n  4  Reconnect / enable Wi-Fi    9  Open Network settings\n  5  Open network login page    q  Quit');
-      const choice = await ask(`\nChoose [${s.advice.action} recommended]: `) || s.advice.action;
+  if (args.includes('--check') || !process.stdin.isTTY || !process.stdout.isTTY) { process.exitCode = s.https ? 0 : 1; return; }
+  while (true) {
+      const choice = await selectAction(s);
       if (choice === 'q') break;
       try {
         if (choice === '7') {
@@ -122,11 +206,11 @@ async function main() {
           const path = `${dir}/fixmyinternet-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
           await writeFile(path, JSON.stringify({ history }, null, 2), { mode: 0o600, flag: 'wx' });
           console.log(`Saved ${path}\nIncludes local IPs, DNS servers, VPN names and DHCP details; review before sharing.`);
-          continue;
+          await ask('Press enter to return.'); continue;
         }
         if (choice === '8') {
           for (const k of ['route', 'dhcp', 'resolvers', 'proxies', 'vpn']) console.log(`\n${paint(1, k)}\n${s.raw[k]?.out || s.raw[k]?.err || '(unavailable)'}`);
-          console.log('\nVPN apps and content filters may not all appear here. Try pausing your VPN in its own app and checking again.'); continue;
+          console.log('\nVPN apps and content filters may not all appear here. Try pausing your VPN in its own app and checking again.'); await ask('Press enter to return.'); continue;
         }
         if (choice === '9') { await execute(['/usr/bin/open', 'x-apple.systempreferences:com.apple.Network-Settings.extension']); continue; }
         if (choice === '5') { await execute(['/usr/bin/open', 'http://captive.apple.com/hotspot-detect.html']); continue; }
@@ -167,9 +251,8 @@ async function main() {
           }
           console.log('Waiting 4 seconds for network configuration…'); await Bun.sleep(4000);
         } else if (choice !== '1') { console.log('Choose 1–9 or q.'); continue; }
-        console.log('Checking…'); s = await diagnose(); history.push(s); show(s);
-      } catch (e) { console.log(paint(31, `\n${e.message}`)); }
-    }
-  } finally { rl.close(); }
+        s = await checking(); history.push(s); show(s);
+      } catch (e) { console.log(paint(31, `\n${e.message}`)); await ask('Press enter to return.'); }
+  }
 }
 if (import.meta.main) main().catch(e => { console.error(e.message); process.exitCode = 1; });
