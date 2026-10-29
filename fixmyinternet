@@ -1,0 +1,175 @@
+#!/usr/bin/env bun
+import { createInterface } from 'node:readline/promises';
+import { homedir } from 'node:os';
+import { mkdir, writeFile } from 'node:fs/promises';
+
+const color = process.stdout.isTTY && !process.env.NO_COLOR;
+const paint = (n, s) => color ? `\x1b[${n}m${s}\x1b[0m` : s;
+const clean = s => s.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '').replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '');
+export async function run(cmd, timeout = 9000) {
+  const start = Date.now();
+  try {
+    const p = Bun.spawn(cmd, { stdout: 'pipe', stderr: 'pipe', stdin: 'ignore', timeout, killSignal: 'SIGKILL' });
+    const [out, err, code] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited]);
+    return { cmd, code, out: clean(out.trim()), err: clean(err.trim()), ms: Date.now() - start };
+  } catch (e) { return { cmd, code: -1, out: '', err: String(e), ms: Date.now() - start }; }
+}
+export function wifiDevice(text) {
+  return text.match(/Hardware Port: (?:Wi-Fi|AirPort)\nDevice: (\S+)/)?.[1];
+}
+export function assess(s) {
+  if (s.https) return { action: '1', text: 'Internet access works now. Use the monitor when switching networks to capture the delay.' };
+  if (s.portal) return { action: '5', text: 'The captive-portal check was redirected or replaced. A network login page may be required.' };
+  if (s.wifiOff && !s.route) return { action: '4', text: 'Wi-Fi is off and there is no IPv4 default route. Turn Wi-Fi on.' };
+  if (s.direct && !s.dns) return { action: '2', text: 'Direct TCP access works but system name resolution failed. Try refreshing DNS.' };
+  if (!s.route && s.badIP) return { action: '3', text: 'No IPv4 default route and no usable Wi-Fi IPv4 address. Check DHCP; IPv6 may still be available.' };
+  if (s.direct) return { action: '8', text: 'Direct TCP access works, but HTTPS failed. Inspect VPN/proxy settings, filtering, and the system clock.' };
+  return { action: '8', text: 'Internet probes failed. Check network details and VPN settings, then try reconnecting Wi-Fi. Probe blocking is also possible.' };
+}
+const curl = url => ['/usr/bin/curl', '-q', '--noproxy', '*', '--connect-timeout', '3', '--max-time', '6', '-sS', '-o', '/dev/null', '-w', '%{http_code}', url];
+export async function diagnose() {
+  const hw = await run(['/usr/sbin/networksetup', '-listallhardwareports']);
+  const device = wifiDevice(hw.out);
+  const commands = {
+    route: ['/sbin/route', '-n', 'get', 'default'],
+    dns: ['/usr/bin/dscacheutil', '-q', 'host', '-a', 'name', 'www.apple.com'],
+    tcp1: ['/usr/bin/nc', '-z', '-G', '3', '-w', '3', '1.1.1.1', '443'],
+    tcp2: ['/usr/bin/nc', '-z', '-G', '3', '-w', '3', '8.8.8.8', '443'],
+    apple: curl('https://www.apple.com/'),
+    cloudflare: curl('https://www.cloudflare.com/'),
+    portal: ['/usr/bin/curl', '-q', '--noproxy', '*', '--connect-timeout', '3', '--max-time', '6', '--max-filesize', '65536', '-sS', '-w', '\n%{http_code}', 'http://captive.apple.com/hotspot-detect.html'],
+    resolvers: ['/usr/sbin/scutil', '--dns'],
+    proxies: ['/usr/sbin/scutil', '--proxy'],
+    vpn: ['/usr/sbin/scutil', '--nc', 'list'],
+  };
+  if (device) Object.assign(commands, {
+    ip: ['/usr/sbin/ipconfig', 'getifaddr', device],
+    power: ['/usr/sbin/networksetup', '-getairportpower', device],
+    dhcp: ['/usr/sbin/ipconfig', 'getpacket', device],
+  });
+  const raw = Object.fromEntries(await Promise.all(Object.entries(commands).map(async ([k, cmd]) => [k, await run(cmd)])));
+  const ip = raw.ip?.out || '';
+  const httpOK = r => r.code === 0 && /^[23]\d\d$/.test(r.out);
+  const portalCode = raw.portal.out.split('\n').at(-1);
+  const s = {
+    time: new Date().toISOString(), device, ip,
+    badIP: !ip || ip.startsWith('169.254.'),
+    wifiOff: /: Off/.test(raw.power?.out || ''),
+    route: raw.route.out.match(/interface: (\S+)/)?.[1] || '',
+    gateway: raw.route.out.match(/gateway: (\S+)/)?.[1] || '',
+    dns: /(?:ip_address|ipv6_address):/.test(raw.dns.out),
+    direct: raw.tcp1.code === 0 || raw.tcp2.code === 0,
+    https: httpOK(raw.apple) || httpOK(raw.cloudflare),
+    portal: raw.portal.code === 0 && (/^3\d\d$/.test(portalCode) || (portalCode === '200' && !/<BODY>Success<\/BODY>/i.test(raw.portal.out))),
+    raw,
+  };
+  s.advice = assess(s);
+  return s;
+}
+function show(s) {
+  const row = (ok, label, detail) => console.log(`  ${paint(ok ? 32 : 33, ok ? '✓' : '·')} ${label.padEnd(17)} ${detail}`);
+  console.log(`\n${paint(1, 'Connection check')}  ${new Date(s.time).toLocaleTimeString()}`);
+  row(!!s.device && !s.wifiOff, 'Wi-Fi', s.device ? `${s.device} · ${s.wifiOff ? 'off' : 'on'} · ${s.ip || 'no IPv4 address'}` : 'No Wi-Fi adapter detected');
+  row(!!s.route, 'IPv4 route', s.route ? `${s.route} via ${s.gateway}` : 'No default route');
+  row(s.direct, 'Direct TCP', s.direct ? 'Reachable without DNS' : 'Both probes failed or were blocked');
+  row(s.dns, 'System DNS', s.dns ? 'Name resolved' : 'No answer within the timeout');
+  row(s.https, 'HTTPS', s.https ? 'Public website reachable' : 'Both website checks failed');
+  row(!s.portal, 'Login portal', s.portal ? 'Possible login / interception detected' : s.raw.portal.code ? 'Check inconclusive' : 'No login detected');
+  const vpn = s.raw.vpn.out.split('\n').filter(l => l.includes('(Connected)'));
+  if (vpn.length) console.log(paint(33, `  VPN active: ${vpn.map(l => l.match(/"([^"]+)"/)?.[1] || l).join(', ')}`));
+  if (/\w+Enable\s*:\s*1/.test(s.raw.proxies.out)) console.log(paint(33, '  A system proxy is enabled. Browser behavior may differ from these direct probes.'));
+  console.log(`\n  ${paint(36, s.advice.text)}\n`);
+}
+async function execute(cmd) {
+  console.log(paint(2, `  $ ${cmd.join(' ')}`));
+  const p = Bun.spawn(cmd, { stdin: 'inherit', stdout: 'inherit', stderr: 'inherit' });
+  if (await p.exited !== 0) throw new Error('Command failed; see output above.');
+}
+async function monitor(history, seconds = 60) {
+  console.log(`Watching for ${seconds}s; Ctrl-C exits. Each pass can take up to 9s.`);
+  const start = Date.now();
+  do {
+    const s = await diagnose(); history.push(s); show(s);
+    console.log(`  Elapsed ${Math.round((Date.now() - start) / 1000)}s`);
+    if (Date.now() - start < seconds * 1000) await Bun.sleep(2000);
+  } while (Date.now() - start < seconds * 1000);
+}
+async function main() {
+  const args = process.argv.slice(2);
+  if (args.includes('--help') || args.includes('-h')) {
+    console.log('fixmyinternet — interactive macOS network troubleshooting\n\n  fixmyinternet           Diagnose, then choose a fix\n  fixmyinternet --check   Read-only diagnosis (exit 0: HTTPS works; 1: failed)\n  fixmyinternet --json    Read-only diagnostic JSON\n  fixmyinternet --watch   Monitor for 60 seconds\n\nNo dependencies beyond Bun and macOS. Fixes run only when selected.\nProbes contact Apple, Cloudflare and Google; they do not upload reports.\nReports are saved only on request to ~/Downloads, with local network details.'); return;
+  }
+  if (args.some(a => !['--check', '--json', '--watch'].includes(a)) || args.length > 1) throw new Error('Unknown or conflicting options. Run fixmyinternet --help.');
+  if (process.platform !== 'darwin') throw new Error('This tool requires macOS.');
+  const history = [];
+  if (args.includes('--watch')) { await monitor(history); return; }
+  if (!args.includes('--json')) console.log(`\n${paint(1, 'fixmyinternet')} ${paint(2, '· macOS network first aid')}\nChecking your connection…`);
+  let s = await diagnose(); history.push(s);
+  if (args.includes('--json')) { console.log(JSON.stringify(s, null, 2)); process.exitCode = s.https ? 0 : 1; return; }
+  show(s);
+  if (args.includes('--check') || !process.stdin.isTTY) { process.exitCode = s.https ? 0 : 1; return; }
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  const ask = async q => (await rl.question(q)).trim().toLowerCase();
+  try {
+    while (true) {
+      console.log('  1  Check again                6  Monitor for 60 seconds\n  2  Refresh DNS cache          7  Save diagnostic report\n  3  Request DHCP configuration 8  Show network details\n  4  Reconnect / enable Wi-Fi    9  Open Network settings\n  5  Open network login page    q  Quit');
+      const choice = await ask(`\nChoose [${s.advice.action} recommended]: `) || s.advice.action;
+      if (choice === 'q') break;
+      try {
+        if (choice === '7') {
+          const dir = `${homedir()}/Downloads`;
+          await mkdir(dir, { recursive: true });
+          const path = `${dir}/fixmyinternet-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+          await writeFile(path, JSON.stringify({ history }, null, 2), { mode: 0o600, flag: 'wx' });
+          console.log(`Saved ${path}\nIncludes local IPs, DNS servers, VPN names and DHCP details; review before sharing.`);
+          continue;
+        }
+        if (choice === '8') {
+          for (const k of ['route', 'dhcp', 'resolvers', 'proxies', 'vpn']) console.log(`\n${paint(1, k)}\n${s.raw[k]?.out || s.raw[k]?.err || '(unavailable)'}`);
+          console.log('\nVPN apps and content filters may not all appear here. Try pausing your VPN in its own app and checking again.'); continue;
+        }
+        if (choice === '9') { await execute(['/usr/bin/open', 'x-apple.systempreferences:com.apple.Network-Settings.extension']); continue; }
+        if (choice === '5') { await execute(['/usr/bin/open', 'http://captive.apple.com/hotspot-detect.html']); continue; }
+        if (choice === '6') { await monitor(history); s = history.at(-1); continue; }
+        if (choice === '2') {
+          console.log('Clears cached DNS answers and signals the macOS DNS responder. Does not change DNS servers.');
+          await execute(['/usr/bin/sudo', '/usr/bin/dscacheutil', '-flushcache']);
+          await execute(['/usr/bin/sudo', '/usr/bin/killall', '-HUP', 'mDNSResponder']);
+        } else if (choice === '3' || choice === '4') {
+          // Refresh adapter information before changing network state.
+          const device = wifiDevice((await run(['/usr/sbin/networksetup', '-listallhardwareports'])).out);
+          if (!device) throw new Error('No Wi-Fi adapter found. Use Network settings for your active connection.');
+          if (choice === '3') {
+            console.log(`Requests temporary automatic IPv4 configuration on ${device}; briefly interrupts Wi-Fi traffic.\nOnly use this on a network using DHCP, not a deliberately static IP configuration.`);
+            if (await ask('Proceed? [y/N] ') !== 'y') continue;
+            await execute(['/usr/bin/sudo', '/usr/sbin/ipconfig', 'set', device, 'DHCP']);
+          } else {
+            console.log(`Turns ${device} off and on. Active Wi-Fi connections will drop; saved networks remain.`);
+            if (await ask('Proceed? [y/N] ') !== 'y') continue;
+            // Authenticate before switching off; always attempt to restore power.
+            await execute(['/usr/bin/sudo', '-v']);
+            let interrupted = false;
+            const deferExit = () => { interrupted = true; };
+            process.on('SIGINT', deferExit);
+            process.on('SIGTERM', deferExit);
+            try {
+              await execute(['/usr/bin/sudo', '-n', '/usr/sbin/networksetup', '-setairportpower', device, 'off']);
+              await Bun.sleep(1500);
+            } finally {
+              try {
+                await execute(['/usr/bin/sudo', '-n', '/usr/sbin/networksetup', '-setairportpower', device, 'on']);
+              } finally {
+                process.removeListener('SIGINT', deferExit);
+                process.removeListener('SIGTERM', deferExit);
+              }
+            }
+            if (interrupted) return;
+          }
+          console.log('Waiting 4 seconds for network configuration…'); await Bun.sleep(4000);
+        } else if (choice !== '1') { console.log('Choose 1–9 or q.'); continue; }
+        console.log('Checking…'); s = await diagnose(); history.push(s); show(s);
+      } catch (e) { console.log(paint(31, `\n${e.message}`)); }
+    }
+  } finally { rl.close(); }
+}
+if (import.meta.main) main().catch(e => { console.error(e.message); process.exitCode = 1; });
